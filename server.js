@@ -9,6 +9,7 @@
  *   DELETE /api/storage/:key         -> { deleted: true }  (404 se não existir)
  *
  *   POST   /api/ocr-romaneio         -> lê o romaneio por foto via IA (Anthropic)
+ *   POST   /api/analisar-contrato    -> lê o texto de um contrato de grãos via IA (Anthropic)
  *
  * Autenticação: header  x-api-key: <API_KEY>
  *
@@ -127,6 +128,68 @@ async function handleOcrRomaneio(req, res) {
         { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } },
         { type: 'text', text: prompt },
       ],
+    }],
+  });
+
+  const options = {
+    hostname: 'api.anthropic.com',
+    path: '/v1/messages',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'Content-Length': Buffer.byteLength(anthropicPayload),
+    },
+  };
+
+  const anthropicReq = https.request(options, (anthropicRes) => {
+    let responseData = '';
+    anthropicRes.on('data', (chunk) => { responseData += chunk; });
+    anthropicRes.on('end', () => {
+      res.writeHead(anthropicRes.statusCode, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(responseData);
+    });
+  });
+
+  anthropicReq.on('error', (err) => {
+    send(res, 502, { error: 'Falha ao consultar a IA', detail: err.message });
+  });
+
+  anthropicReq.write(anthropicPayload);
+  anthropicReq.end();
+}
+
+// ---------- Leitura de contrato de grãos via IA (Anthropic, texto puro) ----------
+async function handleAnalisarContrato(req, res) {
+  if (!checkAuth(req)) {
+    return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    return send(res, 500, { error: 'ANTHROPIC_API_KEY não configurada no servidor' });
+  }
+
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (e) {
+    return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
+  }
+
+  const { prompt } = body;
+  if (!prompt) {
+    return send(res, 400, { error: 'prompt é obrigatório' });
+  }
+
+  const anthropicPayload = JSON.stringify({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1500,
+    messages: [{
+      role: 'user',
+      content: [{ type: 'text', text: prompt }],
     }],
   });
 
@@ -287,6 +350,11 @@ const server = http.createServer(async (req, res) => {
       return handleOcrRomaneio(req, res);
     }
 
+    // Rota de leitura de contrato de grãos por IA — mesma lógica, checada antes do filtro de /api/storage.
+    if (req.method === 'POST' && url.pathname === '/api/analisar-contrato') {
+      return handleAnalisarContrato(req, res);
+    }
+
     // Rota de sincronização com Google Sheets — mesma lógica, checada antes do filtro de /api/storage.
     if (req.method === 'GET' && url.pathname === '/api/sheet-sync') {
       return handleSheetSync(req, res);
@@ -350,6 +418,7 @@ server.listen(PORT, () => {
   console.log(`\n✅ Servidor BRC rodando em http://localhost:${PORT}`);
   console.log(`   Rotas disponíveis em: http://localhost:${PORT}/api/storage`);
   console.log(`   Rota de OCR em: http://localhost:${PORT}/api/ocr-romaneio`);
+  console.log(`   Rota de análise de contrato em: http://localhost:${PORT}/api/analisar-contrato`);
   console.log(`   Rota de sync com Google Sheets em: http://localhost:${PORT}/api/sheet-sync`);
   console.log(`   Dados salvos em: ${DATA_FILE}\n`);
 });
