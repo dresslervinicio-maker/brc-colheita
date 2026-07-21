@@ -1,1 +1,12 @@
-{   "name": "brc-storage-backend",   "version": "1.0.0",   "description": "Backend de storage (referência) para o painel BRC - Colheita e Comercialização",   "main": "server.js",   "scripts": {     "start": "node server.js"   },   "engines": {     "node": ">=18"   } }
+{
+  "name": "brc-colheita-backend",
+  "version": "1.0.0",
+  "description": "Backend de storage + push notifications do BRC - Colheita e Comercialização",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "web-push": "^3.6.7"
+  }
+}

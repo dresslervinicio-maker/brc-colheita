@@ -9,7 +9,6 @@
  *   DELETE /api/storage/:key         -> { deleted: true }  (404 se não existir)
  *
  *   POST   /api/ocr-romaneio         -> lê o romaneio por foto via IA (Anthropic)
- *   POST   /api/analisar-contrato    -> lê o texto de um contrato de grãos via IA (Anthropic)
  *
  * Autenticação: header  x-api-key: <API_KEY>
  *
@@ -27,11 +26,26 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const webpush = require('web-push');
+// ^ única dependência externa deste servidor — necessária porque enviar push de verdade
+//   exige criptografar a mensagem (RFC 8291) e assinar um JWT (VAPID, RFC 8292). Dá pra fazer
+//   isso só com o módulo nativo "crypto", mas é fácil errar um detalhe da criptografia e o push
+//   simplesmente não chegar, sem erro nenhum. "web-push" é a biblioteca padrão da comunidade pra
+//   isso, testada por milhões de sites — por isso abrimos uma exceção à regra de "zero dependências".
+//   Antes de rodar: npm install web-push
 
 // ---------- Configuração ----------
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || '';
 const DATA_FILE = path.join(__dirname, 'data.json');
+
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || '';
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || '';
+if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+  console.warn('\n⚠️  ATENÇÃO: VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configuradas. As notificações push não vão funcionar até você configurar essas variáveis de ambiente.\n');
+} else {
+  webpush.setVapidDetails('mailto:contato@brconsult.com.br', VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+}
 
 if (!API_KEY) {
   console.warn('\n⚠️  ATENÇÃO: nenhuma API_KEY definida. Configure a variável de ambiente API_KEY antes de usar em produção!\n');
@@ -128,68 +142,6 @@ async function handleOcrRomaneio(req, res) {
         { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: base64 } },
         { type: 'text', text: prompt },
       ],
-    }],
-  });
-
-  const options = {
-    hostname: 'api.anthropic.com',
-    path: '/v1/messages',
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'Content-Length': Buffer.byteLength(anthropicPayload),
-    },
-  };
-
-  const anthropicReq = https.request(options, (anthropicRes) => {
-    let responseData = '';
-    anthropicRes.on('data', (chunk) => { responseData += chunk; });
-    anthropicRes.on('end', () => {
-      res.writeHead(anthropicRes.statusCode, {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-      });
-      res.end(responseData);
-    });
-  });
-
-  anthropicReq.on('error', (err) => {
-    send(res, 502, { error: 'Falha ao consultar a IA', detail: err.message });
-  });
-
-  anthropicReq.write(anthropicPayload);
-  anthropicReq.end();
-}
-
-// ---------- Leitura de contrato de grãos via IA (Anthropic, texto puro) ----------
-async function handleAnalisarContrato(req, res) {
-  if (!checkAuth(req)) {
-    return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
-  }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    return send(res, 500, { error: 'ANTHROPIC_API_KEY não configurada no servidor' });
-  }
-
-  let body;
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch (e) {
-    return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
-  }
-
-  const { prompt, maxTokens } = body;
-  if (!prompt) {
-    return send(res, 400, { error: 'prompt é obrigatório' });
-  }
-
-  const anthropicPayload = JSON.stringify({
-    model: 'claude-sonnet-4-6',
-    max_tokens: Math.min(Math.max(Number(maxTokens) || 1500, 256), 8000),
-    messages: [{
-      role: 'user',
-      content: [{ type: 'text', text: prompt }],
     }],
   });
 
@@ -334,6 +286,93 @@ async function handleSheetSync(req, res) {
   }
 }
 
+// ---------- Push notifications (Web Push / VAPID) ----------
+// Guardamos as inscrições dentro do próprio data.json, numa chave por produtor:
+//   push-subs:<produtorId>  ->  { value: [ {endpoint, keys:{p256dh,auth}}, ... ] }
+async function handlePushSubscribe(req, res) {
+  if (!checkAuth(req)) {
+    return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (e) {
+    return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
+  }
+  const { produtorId, subscription } = body;
+  if (!produtorId || !subscription || !subscription.endpoint) {
+    return send(res, 400, { error: 'produtorId e subscription são obrigatórios' });
+  }
+  const chave = 'push-subs:' + produtorId;
+  const atuais = (db[chave] && db[chave].value) || [];
+  const semDuplicata = atuais.filter((s) => s.endpoint !== subscription.endpoint);
+  semDuplicata.push(subscription);
+  db[chave] = { value: semDuplicata, updatedAt: new Date().toISOString() };
+  saveDB(db);
+  return send(res, 200, { ok: true, total: semDuplicata.length });
+}
+
+async function handlePushUnsubscribe(req, res) {
+  if (!checkAuth(req)) {
+    return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (e) {
+    return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
+  }
+  const { produtorId, endpoint } = body;
+  if (!produtorId || !endpoint) {
+    return send(res, 400, { error: 'produtorId e endpoint são obrigatórios' });
+  }
+  const chave = 'push-subs:' + produtorId;
+  const atuais = (db[chave] && db[chave].value) || [];
+  db[chave] = { value: atuais.filter((s) => s.endpoint !== endpoint), updatedAt: new Date().toISOString() };
+  saveDB(db);
+  return send(res, 200, { ok: true });
+}
+
+async function handlePushSend(req, res) {
+  if (!checkAuth(req)) {
+    return send(res, 401, { error: 'chave de API inválida ou ausente (header x-api-key)' });
+  }
+  if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) {
+    return send(res, 500, { error: 'VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY não configuradas no servidor' });
+  }
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (e) {
+    return send(res, 400, { error: 'corpo da requisição precisa ser JSON válido' });
+  }
+  const { produtorId, title, message, url } = body;
+  if (!produtorId || !title) {
+    return send(res, 400, { error: 'produtorId e title são obrigatórios' });
+  }
+  const chave = 'push-subs:' + produtorId;
+  const subs = (db[chave] && db[chave].value) || [];
+  if (!subs.length) {
+    return send(res, 200, { ok: true, enviados: 0, aviso: 'este produtor ainda não ativou notificações em nenhum aparelho' });
+  }
+  const payload = JSON.stringify({ title, body: message || '', url: url || '/' });
+  const restantes = [];
+  let enviados = 0;
+  for (const sub of subs) {
+    try {
+      await webpush.sendNotification(sub, payload);
+      enviados++;
+      restantes.push(sub);
+    } catch (err) {
+      // 404/410 = inscrição expirada/revogada pelo navegador — descartamos, o resto mantemos
+      if (err.statusCode !== 404 && err.statusCode !== 410) restantes.push(sub);
+    }
+  }
+  db[chave] = { value: restantes, updatedAt: new Date().toISOString() };
+  saveDB(db);
+  return send(res, 200, { ok: true, enviados });
+}
+
 // ---------- Servidor ----------
 const server = http.createServer(async (req, res) => {
   try {
@@ -350,14 +389,23 @@ const server = http.createServer(async (req, res) => {
       return handleOcrRomaneio(req, res);
     }
 
-    // Rota de leitura de contrato de grãos por IA — mesma lógica, checada antes do filtro de /api/storage.
-    if (req.method === 'POST' && url.pathname === '/api/analisar-contrato') {
-      return handleAnalisarContrato(req, res);
-    }
-
     // Rota de sincronização com Google Sheets — mesma lógica, checada antes do filtro de /api/storage.
     if (req.method === 'GET' && url.pathname === '/api/sheet-sync') {
       return handleSheetSync(req, res);
+    }
+
+    // Rotas de notificação push
+    if (req.method === 'GET' && url.pathname === '/api/push/vapid-public-key') {
+      return send(res, 200, { publicKey: VAPID_PUBLIC_KEY });
+    }
+    if (req.method === 'POST' && url.pathname === '/api/push/subscribe') {
+      return handlePushSubscribe(req, res);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/push/unsubscribe') {
+      return handlePushUnsubscribe(req, res);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/push/send') {
+      return handlePushSend(req, res);
     }
 
     // Só atende as demais rotas dentro de /api/storage
@@ -418,7 +466,7 @@ server.listen(PORT, () => {
   console.log(`\n✅ Servidor BRC rodando em http://localhost:${PORT}`);
   console.log(`   Rotas disponíveis em: http://localhost:${PORT}/api/storage`);
   console.log(`   Rota de OCR em: http://localhost:${PORT}/api/ocr-romaneio`);
-  console.log(`   Rota de análise de contrato em: http://localhost:${PORT}/api/analisar-contrato`);
   console.log(`   Rota de sync com Google Sheets em: http://localhost:${PORT}/api/sheet-sync`);
+  console.log(`   Rotas de push em: /api/push/vapid-public-key, /api/push/subscribe, /api/push/unsubscribe, /api/push/send`);
   console.log(`   Dados salvos em: ${DATA_FILE}\n`);
 });
