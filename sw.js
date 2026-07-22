@@ -11,7 +11,7 @@ self.addEventListener('activate', (event) => {
 });
 
 self.addEventListener('push', (event) => {
-  let dados = { title: 'BRC - Colheita', body: 'Você tem uma nova notificação.', url: '/' };
+  let dados = { title: 'BRC - Smart Agribusiness Solutions', body: 'Você tem uma nova notificação.', url: '/' };
   try {
     if (event.data) dados = Object.assign(dados, event.data.json());
   } catch (e) {
