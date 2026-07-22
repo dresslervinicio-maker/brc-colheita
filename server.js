@@ -551,6 +551,95 @@ async function handleErpFila(req, res) {
   return send(res, 200, { itens: fila });
 }
 
+// ---------- Push programado (resumo periódico de armazém/secador) ----------
+// Roda no PRÓPRIO SERVIDOR (não depende do navegador de ninguém estar aberto) — lê os mesmos dados
+// que o painel já grava em /api/storage (chaves "cadastros" e "estoque") e dispara via web-push
+// direto daqui. A configuração de cada fazenda (ativo/período/destinatários) é feita no painel,
+// dentro do card "Push programado" do Monitor de Capacidade Operacional — ela é salva normalmente
+// via /api/storage/cadastros, então este verificador sempre lê a versão mais recente.
+function calcSaldoFazendaKgServer(fazendaId, movimentosEstoque) {
+  return movimentosEstoque
+    .filter((m) => m.fazendaId === fazendaId)
+    .reduce((acc, m) => acc + (m.tipo === 'saida' ? -Number(m.pesoKg || 0) : Number(m.pesoKg || 0)), 0);
+}
+function comprometimentoSecadorServer(f, romaneiosArmazem, config) {
+  const secadorTonHora = Number(f.secadorTonHora) || 0;
+  if (!secadorTonHora) return null;
+  const horas = Number(f.janelaRecebimentoHoras) || Number(config?.janelaRecebimentoHoras) || 24;
+  const umidadeSegura = Number(config?.umidadeSeguraPct ?? 14);
+  const limiteTs = Date.now() - horas * 3600 * 1000;
+  const cargasSecador = romaneiosArmazem.filter((r) => {
+    if (r.fazendaId !== f.id) return false;
+    const ts = new Date(r.createdAt || r.dataEntrada).getTime();
+    if (isNaN(ts) || ts < limiteTs) return false;
+    const pesoBruto = Number(r.pesoBruto) || 0;
+    if (!pesoBruto) return false;
+    return (Number(r.umidade || 0) / pesoBruto * 100) > umidadeSegura;
+  });
+  const kgNoSecador = cargasSecador.reduce((s, r) => s + Number(r.pesoLiquido || 0), 0);
+  const capacidadeSecadorKg = secadorTonHora * 1000 * horas;
+  const umidadeMediaSecador = cargasSecador.length
+    ? cargasSecador.reduce((s, r) => s + (Number(r.umidade || 0) / Number(r.pesoBruto || 1) * 100), 0) / cargasSecador.length
+    : null;
+  return {
+    capacidadeSecadorKg, kgNoSecador, umidadeMediaSecador,
+    pct: capacidadeSecadorKg > 0 ? (kgNoSecador / capacidadeSecadorKg * 100) : 0,
+  };
+}
+async function verificarPushesProgramadosServidor() {
+  try {
+    if (!VAPID_PUBLIC_KEY || !VAPID_PRIVATE_KEY) return; // sem chaves configuradas, não tem como enviar
+    const cadastrosRaw = db['cadastros'] && db['cadastros'].value;
+    const estoqueRaw = db['estoque'] && db['estoque'].value;
+    if (!cadastrosRaw || !estoqueRaw) return;
+    const cadastros = JSON.parse(cadastrosRaw);
+    const estoque = JSON.parse(estoqueRaw);
+    const fazendas = cadastros.fazendas || [];
+    const config = cadastros.config || {};
+    const movimentosEstoque = estoque.movimentosEstoque || [];
+    const romaneiosArmazem = estoque.romaneiosArmazem || [];
+    let mudou = false;
+
+    for (const f of fazendas) {
+      const cfg = f.pushProgramado;
+      if (!cfg || !cfg.ativo || !(cfg.usuarioIds || []).length) continue;
+      const periodoMs = (Number(cfg.periodoHoras) || 12) * 3600 * 1000;
+      const ultimoEnvio = f.pushProgramadoUltimoEnvio ? new Date(f.pushProgramadoUltimoEnvio).getTime() : 0;
+      if (Date.now() - ultimoEnvio < periodoMs) continue;
+
+      const capacidadeKg = Number(f.armazemKg) || 0;
+      const saldoKg = calcSaldoFazendaKgServer(f.id, movimentosEstoque);
+      const disponivelKg = Math.max(0, capacidadeKg - saldoKg);
+      const secador = comprometimentoSecadorServer(f, romaneiosArmazem, config);
+      const title = `📋 Resumo periódico — ${f.nome}`;
+      const message = `Armazenado: ${(saldoKg / 1000).toFixed(1)} t · Livre: ${(disponivelKg / 1000).toFixed(1)} t` +
+        (secador ? ` · Secador: ${secador.pct.toFixed(0)}% comprometido · Umidade média: ${secador.umidadeMediaSecador !== null ? secador.umidadeMediaSecador.toFixed(1) + '%' : '—'}` : '');
+      const payload = JSON.stringify({ title, body: message, url: '/' });
+
+      for (const usuarioId of cfg.usuarioIds) {
+        const chaveSub = 'push-subs:' + usuarioId;
+        const subs = (db[chaveSub] && db[chaveSub].value) || [];
+        const restantes = [];
+        for (const sub of subs) {
+          try { await webpush.sendNotification(sub, payload); restantes.push(sub); }
+          catch (err) { if (err.statusCode !== 404 && err.statusCode !== 410) restantes.push(sub); }
+        }
+        db[chaveSub] = { value: restantes, updatedAt: new Date().toISOString() };
+      }
+      f.pushProgramadoUltimoEnvio = new Date().toISOString();
+      mudou = true;
+    }
+
+    if (mudou) {
+      cadastros.fazendas = fazendas;
+      db['cadastros'] = { value: JSON.stringify(cadastros), updatedAt: new Date().toISOString() };
+      saveDB(db);
+    }
+  } catch (e) { console.error('Falha ao verificar pushes programados:', e); }
+}
+setInterval(verificarPushesProgramadosServidor, 10 * 60 * 1000);
+verificarPushesProgramadosServidor(); // já roda uma vez na subida do servidor, não só a cada 10 min
+
 // ---------- Servidor ----------
 const server = http.createServer(async (req, res) => {
   try {
@@ -662,6 +751,7 @@ server.listen(PORT, () => {
   console.log(`   Rota de análise de contrato em: http://localhost:${PORT}/api/analisar-contrato`);
   console.log(`   Rota de sync com Google Sheets em: http://localhost:${PORT}/api/sheet-sync`);
   console.log(`   Rotas de integração ERP em: POST /api/erp/webhook-nf (o ERP chama) e GET /api/erp/fila (o painel busca)`);
+  console.log(`   Push programado (resumo periódico de armazém/secador): verificação a cada 10 min, direto no servidor`);
   console.log(`   Rotas de push em: /api/push/vapid-public-key, /api/push/subscribe, /api/push/unsubscribe, /api/push/send, /api/push/broadcast`);
   console.log(`   Dados salvos em: ${DATA_FILE}\n`);
 });
