@@ -579,6 +579,7 @@ function capacidadeEfetivaSecadorServer(capacidadeNominalTonHora, ueRefPct, usAl
 function comprometimentoSecadorServer(f, romaneiosArmazem, config) {
   const secadorTonHora = Number(f.secadorTonHora) || 0;
   if (!secadorTonHora) return null;
+  if (f.secadorSuspenso) return { suspenso: true };
   const horas = Number(f.janelaRecebimentoHoras) || Number(config?.janelaRecebimentoHoras) || 24;
   const umidadeSegura = Number(config?.umidadeSeguraPct ?? 14);
   const limiteTs = Date.now() - horas * 3600 * 1000;
@@ -632,7 +633,7 @@ async function verificarPushesProgramadosServidor() {
       const secador = comprometimentoSecadorServer(f, romaneiosArmazem, config);
       const title = `📋 Resumo periódico — ${f.nome}`;
       const message = `Armazenado: ${(saldoKg / 1000).toFixed(1)} t · Livre: ${(disponivelKg / 1000).toFixed(1)} t` +
-        (secador ? ` · Secador: ${secador.pct.toFixed(0)}% comprometido · Umidade média: ${secador.umidadeMediaSecador !== null ? secador.umidadeMediaSecador.toFixed(1) + '%' : '—'}` : '');
+        (secador?.suspenso ? ` · Secador: SUSPENSO` : secador ? ` · Secador: ${secador.pct.toFixed(0)}% comprometido · Umidade média: ${secador.umidadeMediaSecador !== null ? secador.umidadeMediaSecador.toFixed(1) + '%' : '—'}` : '');
       const payload = JSON.stringify({ title, body: message, url: '/' });
 
       for (const usuarioId of cfg.usuarioIds) {
